@@ -1,0 +1,275 @@
+#
+# FILE            aas_write_back.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# AssetChannel write-back (coraine's doc/asset-channels.md, channelDirection both): a client's write to an
+# attribute made from an element goes to the AAS server first - PATCH .../submodel-elements/<idShortPath>/$value,
+# the ValueOnly form - and is stored when the bridge takes it:
+#
+#   pressure, mode                     Properties (xs:double, xs:string)
+#   manufacturerName                   a MultiLanguageProperty - [ { "<language>": text } ]
+#   markings                           a SubmodelElementList of xs:string
+#   pressureRange                      a Range - { "min", "max" }
+#   addressInformationStreet           a Property in a collection - its idShortPath AddressInformation.Street
+#
+# A value that does not fit the element's valueType is refused before anything is sent (the bridge's payload
+# check): 400. A File and the shell's assetInformation are not written back, a Relationship is made of no one
+# element: 422. A value the server itself refuses was stored - the element is read back at once, and the
+# entity shows what the server has. The server's own changes still come in; a write's echo is no value in.
+#
+# REQUIRE_FEATURE: ASSET_CHANNELS
+# REQUIRE_FEATURE: CHANNEL_WRITE_BACK
+#
+--NAME--
+aas bridge - AssetChannel write-back: a client's write PATCHed to the element's $value first
+
+--TAGS--
+bridge aas
+
+--INIT--
+rm -rf "${AAS_TEST_DIR:?}"
+mkdir -p "$AAS_TEST_DIR"
+cat > $AAS_TEST_DIR/bridges.json <<J
+{ "aas": { "server": { "url": "http://localhost:$AAS_MOCK_PORT" },
+           "ngsild": { "defaultEntity": false, "assetChannels": {
+             "https://acme.example/ids/aas/press-17": { "entities": "natural", "channelDirection": "both",
+                                                        "channelInfo": [ { "key": "pollInterval", "value": "PT0.2S" } ] } } } } }
+J
+mockStart
+brokerStart
+
+--RUN--
+OP=https://acme.example/ids/sm/press-17/operational
+NP=https://acme.example/ids/sm/press-17/nameplate
+SH=https://acme.example/ids/aas/press-17
+entityAwait $OP pressure 212.5
+
+echo "01. PATCH pressure 300 - PATCHed to OperationalData.Pressure, then stored"
+echo "========================================================================="
+attrPatch $OP pressure '{"value": 300}'
+serverAwait 'PATCH OperationalData.Pressure 300'
+entityGet $OP pressure keyValues
+echo
+echo
+
+
+echo "02. PATCH mode \"manual\""
+echo "======================="
+attrPatch $OP mode '{"value": "manual"}'
+serverAwait 'PATCH OperationalData.Mode "manual"'
+echo
+echo
+
+
+echo "03. PATCH manufacturerName - a LanguageProperty: the MLP's ValueOnly form"
+echo "========================================================================="
+attrPatch $NP manufacturerName '{"type": "LanguageProperty", "languageMap": {"en": "ACME", "de": "ACME DE"}}'
+serverAwait 'PATCH Nameplate.ManufacturerName [{"en":"ACME"},{"de":"ACME DE"}]'
+echo
+echo
+
+
+echo "04. PATCH markings - a ListProperty: the list's values"
+echo "======================================================"
+attrPatch $NP markings '{"type": "ListProperty", "valueList": ["CE", "UKCA", "FCC"]}'
+serverAwait 'PATCH Nameplate.Markings ["CE","UKCA","FCC"]'
+echo
+echo
+
+
+echo "05. PATCH pressureRange - a Range: { min, max }"
+echo "==============================================="
+attrPatch $OP pressureRange '{"value": {"min": 10, "max": 350}}'
+serverAwait 'PATCH OperationalData.PressureRange {"min":10,"max":350}'
+echo
+echo
+
+
+echo "06. PATCH addressInformationStreet - a Property in a collection: its idShortPath"
+echo "================================================================================"
+attrPatch $NP addressInformationStreet '{"value": "Nebenstr. 2"}'
+serverAwait 'PATCH Nameplate.AddressInformation.Street "Nebenstr. 2"'
+echo
+echo
+
+
+echo "07. Values that do not fit - pressure \"high\" (xs:double), yearOfConstruction 3000000000 (xs:int), a text 7: 400, nothing sent"
+echo "============================================================================================================================="
+attrPatchShow $OP pressure '{"value": "high"}'
+attrPatchShow $NP yearOfConstruction '{"value": 3000000000}'
+attrPatchShow $NP manufacturerName '{"type": "LanguageProperty", "languageMap": {"en": 7}}'
+echo
+echo
+
+
+echo "08. Not written back - a File, the shell's globalAssetId: 422; a Relationship, made of no one element: 422"
+echo "=========================================================================================================="
+attrPatch $NP manual '{"value": "https://acme.example/other.pdf"}'
+attrPatch $SH globalAssetId '{"value": "https://acme.example/assets/other"}'
+attrPatch $OP documentation '{"object": "urn:ngsi-ld:Thing:other"}'
+echo
+echo
+
+
+echo "09. PATCH mode \"broken\" - the server refuses it: stored, then read back - mode \"manual\" again"
+echo "=============================================================================================="
+attrPatch $OP mode '{"value": "broken"}'
+serverAwait 'PATCH OperationalData.Mode "broken"'
+entityAwait $OP mode '"manual"'
+entityGet $OP mode keyValues
+echo
+echo
+
+
+echo "10. The server's own change still comes in - the pressure 305"
+echo "============================================================="
+mockSet $OP Pressure '"305"'
+entityAwait $OP pressure 305
+echo "pressure 305"
+echo
+echo
+
+
+echo "11. The entities - what the server has"
+echo "======================================"
+entityGet $OP pressure,mode,pressureRange keyValues
+entityGet $NP manufacturerName,markings,addressInformationStreet,yearOfConstruction keyValues
+echo
+echo
+
+
+echo "12. GET /assetChannels - seven values out (the refused one too); in: mode read back, the pressure 305 - no echo"
+echo "==============================================================================================================="
+assetChannels
+echo "The server was asked:"
+serverLog
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+mockStop
+rm -f "${AAS_TEST_DIR:?}/bridges.json"
+
+--EXPECT--
+01. PATCH pressure 300 - PATCHed to OperationalData.Pressure, then stored
+=========================================================================
+204
+PATCH OperationalData.Pressure 300
+{
+  "id": "https://acme.example/ids/sm/press-17/operational",
+  "pressure": 300,
+  "type": "OperationalData"
+}
+
+
+02. PATCH mode "manual"
+=======================
+204
+PATCH OperationalData.Mode "manual"
+
+
+03. PATCH manufacturerName - a LanguageProperty: the MLP's ValueOnly form
+=========================================================================
+204
+PATCH Nameplate.ManufacturerName [{"en":"ACME"},{"de":"ACME DE"}]
+
+
+04. PATCH markings - a ListProperty: the list's values
+======================================================
+204
+PATCH Nameplate.Markings ["CE","UKCA","FCC"]
+
+
+05. PATCH pressureRange - a Range: { min, max }
+===============================================
+204
+PATCH OperationalData.PressureRange {"min":10,"max":350}
+
+
+06. PATCH addressInformationStreet - a Property in a collection: its idShortPath
+================================================================================
+204
+PATCH Nameplate.AddressInformation.Street "Nebenstr. 2"
+
+
+07. Values that do not fit - pressure "high" (xs:double), yearOfConstruction 3000000000 (xs:int), a text 7: 400, nothing sent
+=============================================================================================================================
+400
+"bridge 'aas' refused the value of 'https://uri.etsi.org/ngsi-ld/default-context/pressure' (https://acme.example/ids/sm/press-17/operational#Pressure): not an xs:double - a number - nothing was written"
+400
+"bridge 'aas' refused the value of 'https://uri.etsi.org/ngsi-ld/default-context/yearOfConstruction' (https://acme.example/ids/sm/press-17/nameplate#YearOfConstruction): not an xs:int - nothing was written"
+400
+"languageMap values must be strings or arrays of strings (key 'en')"
+
+
+08. Not written back - a File, the shell's globalAssetId: 422; a Relationship, made of no one element: 422
+==========================================================================================================
+422
+422
+422
+
+
+09. PATCH mode "broken" - the server refuses it: stored, then read back - mode "manual" again
+==============================================================================================
+204
+PATCH OperationalData.Mode "broken"
+{
+  "id": "https://acme.example/ids/sm/press-17/operational",
+  "mode": "manual",
+  "type": "OperationalData"
+}
+
+
+10. The server's own change still comes in - the pressure 305
+=============================================================
+pressure 305
+
+
+11. The entities - what the server has
+======================================
+{
+  "id": "https://acme.example/ids/sm/press-17/operational",
+  "mode": "manual",
+  "pressure": 305,
+  "pressureRange": {
+    "max": 350,
+    "min": 10
+  },
+  "type": "OperationalData"
+}
+{
+  "addressInformationStreet": "Nebenstr. 2",
+  "id": "https://acme.example/ids/sm/press-17/nameplate",
+  "manufacturerName": {
+    "languageMap": {
+      "de": "ACME DE",
+      "en": "ACME"
+    }
+  },
+  "markings": [
+    "CE",
+    "UKCA",
+    "FCC"
+  ],
+  "type": "Nameplate",
+  "yearOfConstruction": 2024
+}
+
+
+12. GET /assetChannels - seven values out (the refused one too); in: mode read back, the pressure 305 - no echo
+===============================================================================================================
+https://acme.example/ids/aas/press-17 available - both valuesIn=2 valuesOut=7
+The server was asked:
+PATCH OperationalData.Pressure 300
+PATCH OperationalData.Mode "manual"
+PATCH Nameplate.ManufacturerName [{"en":"ACME"},{"de":"ACME DE"}]
+PATCH Nameplate.Markings ["CE","UKCA","FCC"]
+PATCH OperationalData.PressureRange {"min":10,"max":350}
+PATCH Nameplate.AddressInformation.Street "Nebenstr. 2"
+PATCH OperationalData.Mode "broken"
+
+

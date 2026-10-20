@@ -1,0 +1,278 @@
+#
+# FILE            aas_model.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# An AAS shell as an AssetChannel (coraine's doc/aas.md, entities natural): the shell, its submodels and their
+# elements read from the AAS server (GET /shells/{id}, /submodels/{id}, the ids base64url) and handed over as the
+# model - three entities:
+#
+#   the shell             type Shell, its assetInformation (globalAssetId, assetKind), a Relationship per submodel
+#   the Nameplate         an MLP a LanguageProperty, a collection flattened (attributes), a list a ListProperty,
+#                         a File its URL (a path on the server: the API's attachment URL) and contentType, a Blob
+#                         the attachment URL; a Property with no value, and a Capability, make nothing
+#   OperationalData       values converted by valueType (xs:double, xs:boolean), a Range { min, max }, a
+#                         ReferenceElement to the Nameplate a Relationship, an external one a Property; the
+#                         Operations make no attribute
+#
+# GET /admin/bridges/aas/inventory - the server's shells and submodels; ?from=<id> - that one's model.
+#
+# REQUIRE_FEATURE: ASSET_CHANNELS
+#
+--NAME--
+aas bridge - a shell and its submodels as entities: elements to attributes, the inventory
+
+--TAGS--
+bridge aas
+
+--INIT--
+rm -rf "${AAS_TEST_DIR:?}"
+mkdir -p "$AAS_TEST_DIR"
+cat > $AAS_TEST_DIR/bridges.json <<J
+{ "aas": { "server": { "url": "http://localhost:$AAS_MOCK_PORT" },
+           "ngsild": { "defaultEntity": false, "assetChannels": {
+             "https://acme.example/ids/aas/press-17": { "entities": "natural" } } } } }
+J
+mockStart
+brokerStart --apiPlugins admin
+
+--RUN--
+B="localhost:$AAS_PORT/ngsi-ld/v1"
+entityAwait https://acme.example/ids/sm/press-17/operational pressure 212.5
+
+echo "01. The three entities"
+echo "======================"
+curl -s "$B/entities?type=Shell,Nameplate,OperationalData" | python3 -c 'import sys, json
+print(json.dumps(sorted(json.load(sys.stdin), key=lambda e: e["id"]), indent=2, sort_keys=True))'
+echo
+echo
+
+
+echo "02. GET /assetChannels - available"
+echo "=================================="
+assetChannels
+echo
+echo
+
+
+echo "03. The inventory - the server's shells and submodels"
+echo "====================================================="
+curl -s "localhost:$AAS_PORT/admin/bridges/aas/inventory" | python3 -c 'import sys, json; print(json.dumps(json.load(sys.stdin), indent=2, sort_keys=True))'
+echo
+echo
+
+
+echo "04. The inventory from the operational submodel - its model, the Operations with their variables"
+echo "================================================================================================="
+curl -s "localhost:$AAS_PORT/admin/bridges/aas/inventory?from=$(urlEncode https://acme.example/ids/sm/press-17/operational)" | python3 -c 'import sys, json
+m = json.load(sys.stdin)
+print(m["node"], m["id"], m["name"])
+for c in m["children"]:
+    print(" ", c["node"], c["name"], c.get("id", "-"), json.dumps(c.get("value")), json.dumps(c.get("input")), json.dumps(c.get("output")))
+for r in m.get("references", []):
+    print("  reference", r["type"], r["target"])'
+echo
+echo
+
+
+echo "05. The inventory from an id the server does not have - 404"
+echo "==========================================================="
+curl -s -o /dev/null -w "%{http_code}\n" "localhost:$AAS_PORT/admin/bridges/aas/inventory?from=urn:nothing"
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+mockStop
+rm -f "${AAS_TEST_DIR:?}/bridges.json"
+
+--EXPECT--
+01. The three entities
+======================
+[
+  {
+    "assetKind": {
+      "type": "Property",
+      "value": "Instance"
+    },
+    "globalAssetId": {
+      "type": "Property",
+      "value": "https://acme.example/assets/press-17"
+    },
+    "id": "https://acme.example/ids/aas/press-17",
+    "nameplate": {
+      "object": "https://acme.example/ids/sm/press-17/nameplate",
+      "type": "Relationship"
+    },
+    "operationalData": {
+      "object": "https://acme.example/ids/sm/press-17/operational",
+      "type": "Relationship"
+    },
+    "type": "Shell"
+  },
+  {
+    "addressInformationCityTown": {
+      "languageMap": {
+        "de": "Berlin"
+      },
+      "type": "LanguageProperty"
+    },
+    "addressInformationStreet": {
+      "type": "Property",
+      "value": "Hauptstr. 1"
+    },
+    "id": "https://acme.example/ids/sm/press-17/nameplate",
+    "logo": {
+      "contentType": {
+        "type": "Property",
+        "value": "image/png"
+      },
+      "type": "Property",
+      "value": "https://acme.example/logo.png"
+    },
+    "manual": {
+      "contentType": {
+        "type": "Property",
+        "value": "application/pdf"
+      },
+      "type": "Property",
+      "value": "http://localhost:REGEX([0-9]+)/submodels/aHR0cHM6Ly9hY21lLmV4YW1wbGUvaWRzL3NtL3ByZXNzLTE3L25hbWVwbGF0ZQ/submodel-elements/Manual/attachment"
+    },
+    "manufacturerName": {
+      "languageMap": {
+        "de": "ACME Pressen",
+        "en": "ACME Presses"
+      },
+      "semanticId": {
+        "type": "Property",
+        "value": "0112/2///61987#ABA565#009"
+      },
+      "type": "LanguageProperty"
+    },
+    "markings": {
+      "type": "ListProperty",
+      "valueList": [
+        "CE",
+        "UKCA"
+      ]
+    },
+    "semanticId": {
+      "type": "Property",
+      "value": "https://admin-shell.io/idta/nameplate/3/0/Nameplate"
+    },
+    "serialNumber": {
+      "semanticId": {
+        "type": "Property",
+        "value": "0112/2///61987#ABA951#009"
+      },
+      "type": "Property",
+      "value": "P17-0042"
+    },
+    "thumbnail": {
+      "contentType": {
+        "type": "Property",
+        "value": "image/png"
+      },
+      "type": "Property",
+      "value": "http://localhost:REGEX([0-9]+)/submodels/aHR0cHM6Ly9hY21lLmV4YW1wbGUvaWRzL3NtL3ByZXNzLTE3L25hbWVwbGF0ZQ/submodel-elements/Thumbnail/attachment"
+    },
+    "type": "Nameplate",
+    "yearOfConstruction": {
+      "type": "Property",
+      "value": 2024
+    }
+  },
+  {
+    "certificate": {
+      "type": "Property",
+      "value": "https://certs.example/p17"
+    },
+    "documentation": {
+      "object": "https://acme.example/ids/sm/press-17/nameplate",
+      "type": "Relationship"
+    },
+    "id": "https://acme.example/ids/sm/press-17/operational",
+    "mode": {
+      "type": "Property",
+      "value": "auto"
+    },
+    "pressure": {
+      "type": "Property",
+      "value": 212.5
+    },
+    "pressureRange": {
+      "type": "Property",
+      "value": {
+        "max": 400,
+        "min": 0
+      }
+    },
+    "running": {
+      "type": "Property",
+      "value": true
+    },
+    "type": "OperationalData"
+  }
+]
+
+
+02. GET /assetChannels - available
+==================================
+https://acme.example/ids/aas/press-17 available - in valuesIn=0 valuesOut=-
+
+
+03. The inventory - the server's shells and submodels
+=====================================================
+{
+  "shells": [
+    {
+      "id": "https://acme.example/ids/aas/press-17",
+      "idShort": "Press17",
+      "submodels": [
+        "https://acme.example/ids/sm/press-17/nameplate",
+        "https://acme.example/ids/sm/press-17/operational"
+      ]
+    },
+    {
+      "id": "https://acme.example/ids/aas/press-18",
+      "idShort": "Press18",
+      "submodels": [
+        "https://acme.example/ids/sm/none"
+      ]
+    }
+  ],
+  "submodels": [
+    {
+      "id": "https://acme.example/ids/sm/press-17/nameplate",
+      "idShort": "Nameplate",
+      "semanticId": "https://admin-shell.io/idta/nameplate/3/0/Nameplate"
+    },
+    {
+      "id": "https://acme.example/ids/sm/press-17/operational",
+      "idShort": "OperationalData"
+    }
+  ]
+}
+
+
+04. The inventory from the operational submodel - its model, the Operations with their variables
+=================================================================================================
+submodel https://acme.example/ids/sm/press-17/operational OperationalData
+  property Pressure https://acme.example/ids/sm/press-17/operational#Pressure 212.5 null null
+  property Running https://acme.example/ids/sm/press-17/operational#Running true null null
+  property Mode https://acme.example/ids/sm/press-17/operational#Mode "auto" null null
+  property PressureRange https://acme.example/ids/sm/press-17/operational#PressureRange {"min": 0, "max": 400} null null
+  operation SetSpeed https://acme.example/ids/sm/press-17/operational#SetSpeed null [{"name": "speed", "valueType": "xs:double"}, {"name": "ramp", "valueType": "xs:boolean"}] [{"name": "previous", "valueType": "xs:double"}]
+  operation Stop https://acme.example/ids/sm/press-17/operational#Stop null [] []
+  operation Log https://acme.example/ids/sm/press-17/operational#Log null [{"name": "lines", "valueType": "xs:string"}] [{"name": "count", "valueType": "xs:int"}]
+  reference Documentation https://acme.example/ids/sm/press-17/nameplate
+  reference Certificate https://certs.example/p17
+
+
+05. The inventory from an id the server does not have - 404
+===========================================================
+404
+
+
