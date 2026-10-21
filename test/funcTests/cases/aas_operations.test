@@ -1,0 +1,244 @@
+#
+# FILE            aas_operations.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# AAS Operations as Service Executions (coraine's doc/service-execution.md, a bridge executor): a Service
+# Registration whose endpoint is aas+http://<server>/submodels/<id, base64url>/submodel-elements/<idShortPath> is
+# executed by the bridge - the Operation's variables read, the execution input its input arguments by idShort
+# (each converted to the variable's valueType), POST .../invoke; the output its output arguments by idShort:
+#
+#   setSpeed   OperationalData.SetSpeed: in speed (xs:double), ramp (xs:boolean); out previous (xs:double)
+#   log        OperationalData.Log: in lines (xs:string); out count (xs:int)
+#   stop       OperationalData.Stop: the operation fails - its message the reason
+#   nope       an element the server does not have
+#   pressure   an element that is no Operation
+#   bad        aas+http://<server>/shells/x - no element: no service of the bridge, 503
+#
+# A failed invocation fails the execution: 502, the ProblemDetails saying why - an input that does not fit the
+# variables is refused before anything is invoked. With the server down an invocation fails at once.
+#
+# REQUIRE_FEATURE: ASSET_CHANNELS
+# REQUIRE_FEATURE: SERVICE_EXECUTION
+#
+--NAME--
+aas bridge - Operations as Service Executions: the input its arguments by idShort, the output by idShort
+
+--TAGS--
+bridge aas
+
+--INIT--
+rm -rf "${AAS_TEST_DIR:?}"
+mkdir -p "$AAS_TEST_DIR"
+cat > $AAS_TEST_DIR/bridges.json <<J
+{ "aas": { "server": { "url": "http://localhost:$AAS_MOCK_PORT" },
+           "ngsild": { "defaultEntity": false, "assetChannels": {
+             "https://acme.example/ids/aas/press-17": { "entities": "natural" } } } } }
+J
+mockStart
+brokerStart
+
+--RUN--
+B="http://localhost:$AAS_PORT/ngsi-ld/v1"
+OP=https://acme.example/ids/sm/press-17/operational
+E=$(urlEncode $OP)
+SM=$(python3 -c 'import base64, sys; print(base64.urlsafe_b64encode(sys.argv[1].encode()).decode().rstrip("="))' $OP)
+EP="aas+http://localhost:$AAS_MOCK_PORT/submodels/$SM/submodel-elements"
+
+reg() {  # reg <serviceName> <endpoint> - the HTTP status
+  curl -s -o /dev/null -w "%{http_code}\n" "$B/serviceRegistrations" -H 'Content-Type: application/json' \
+       -d "{\"type\":\"ServiceRegistration\",\"endpoint\":\"$2\",\"entities\":[{\"id\":\"$OP\",\"type\":\"OperationalData\"}],\"serviceInformation\":{\"serviceName\":\"$1\"}}"
+}
+invoke() {  # invoke <serviceName> <input> - the status, then the body: the output, or the error's detail
+  curl -s -w "\n%{http_code}\n" "$B/entities/$E/services/$1" -H 'Content-Type: application/json' -d "$2" > "$AAS_TEST_DIR/invoke.out"
+  tail -1 "$AAS_TEST_DIR/invoke.out"
+  head -n -1 "$AAS_TEST_DIR/invoke.out" | python3 -c '
+import json, sys
+text = sys.stdin.read().strip()
+b = json.loads(text) if text else None
+print(json.dumps(b.get("detail") if isinstance(b, dict) and "detail" in b and "status" in b else b, sort_keys=True))'
+}
+
+entityAwait $OP pressure 212.5
+
+echo "01. A Service Registration per Operation - and for an element that is none, and an endpoint with no element"
+echo "============================================================================================================"
+reg setSpeed "$EP/SetSpeed"
+reg log      "$EP/Log"
+reg stop     "$EP/Stop"
+reg nope     "$EP/Nope"
+reg pressure "$EP/Pressure"
+reg bad      "aas+http://localhost:$AAS_MOCK_PORT/shells/x"
+echo
+echo
+
+
+echo "02. setSpeed 12.5, ramp - invoked, its output the previous speed (0)"
+echo "===================================================================="
+invoke setSpeed '{"speed": 12.5, "ramp": true}'
+serverAwait "invoke OperationalData.SetSpeed speed=12.5 ramp=true"
+echo
+echo
+
+
+echo "03. setSpeed 20 - the previous speed 12.5"
+echo "========================================="
+invoke setSpeed '{"speed": 20, "ramp": false}'
+echo
+echo
+
+
+echo "04. log - an xs:string in, an xs:int out"
+echo "========================================"
+invoke log '{"lines": "a,b"}'
+echo
+echo
+
+
+echo "05. Inputs that do not fit the variables - not an xs:double, a missing one, one too many: 502, nothing invoked"
+echo "=============================================================================================================="
+invoke setSpeed '{"speed": "fast", "ramp": true}'
+invoke setSpeed '{"speed": 1}'
+invoke setSpeed '{"speed": 1, "ramp": true, "force": 9}'
+echo
+echo
+
+
+echo "06. stop - the operation fails: 502, its message"
+echo "================================================"
+invoke stop '{}'
+echo
+echo
+
+
+echo "07. nope - no such element: 502; pressure - no Operation: 502"
+echo "============================================================="
+invoke nope '{}'
+invoke pressure '{}'
+echo
+echo
+
+
+echo "08. bad - no element in the endpoint: the bridge has no such service, 503"
+echo "========================================================================="
+invoke bad '{}'
+echo
+echo
+
+
+echo "09. POST /services - the same invocation as an execution resource: completed, the output kept"
+echo "============================================================================================="
+curl -s -o /dev/null -w "%{http_code}\n" -D "$AAS_TEST_DIR/headers" "$B/services" -H 'Content-Type: application/json' \
+     -d "{\"type\":\"ServiceExecution\",\"entityId\":\"$OP\",\"serviceName\":\"setSpeed\",\"executionInput\":{\"speed\":30,\"ramp\":true}}"
+id=$(grep -i '^Service-Execution:' "$AAS_TEST_DIR/headers" | awk '{print $2}' | tr -d '\r')
+for i in $(seq 1 50); do curl -s "$B/services/$id" | grep -q '"completed"' && break; sleep 0.1; done
+curl -s "$B/services/$id" | python3 -c '
+import json, sys
+e = json.load(sys.stdin)
+print(e["executionStatus"], json.dumps(e.get("executionInput"), sort_keys=True), json.dumps(e.get("executionOutput")))'
+echo
+echo
+
+
+echo "10. The server's invocations - only those that reached it"
+echo "========================================================="
+serverLog
+echo
+echo
+
+
+echo "11. The server stops - an invocation fails at once: 502, not reachable"
+echo "======================================================================"
+mockStop
+invoke setSpeed '{"speed": 40, "ramp": true}'
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+mockStop
+rm -f "${AAS_TEST_DIR:?}/bridges.json"
+
+--EXPECT--
+01. A Service Registration per Operation - and for an element that is none, and an endpoint with no element
+============================================================================================================
+201
+201
+201
+201
+201
+201
+
+
+02. setSpeed 12.5, ramp - invoked, its output the previous speed (0)
+====================================================================
+200
+{"previous": 0}
+invoke OperationalData.SetSpeed speed=12.5 ramp=true
+
+
+03. setSpeed 20 - the previous speed 12.5
+=========================================
+200
+{"previous": 12.5}
+
+
+04. log - an xs:string in, an xs:int out
+========================================
+200
+{"count": 2}
+
+
+05. Inputs that do not fit the variables - not an xs:double, a missing one, one too many: 502, nothing invoked
+==============================================================================================================
+502
+"the input variable 'speed': not an xs:double - a number"
+502
+"the input has no 'ramp' - an input variable of the operation"
+502
+"'force' is no input variable of the operation"
+
+
+06. stop - the operation fails: 502, its message
+================================================
+502
+"the press is not running"
+
+
+07. nope - no such element: 502; pressure - no Operation: 502
+=============================================================
+502
+"the server has no such operation"
+502
+"the element is no Operation"
+
+
+08. bad - no element in the endpoint: the bridge has no such service, 503
+=========================================================================
+503
+"no loaded bridge executes this service"
+
+
+09. POST /services - the same invocation as an execution resource: completed, the output kept
+=============================================================================================
+201
+completed {"ramp": true, "speed": 30} {"previous": 20}
+
+
+10. The server's invocations - only those that reached it
+=========================================================
+invoke OperationalData.SetSpeed speed=12.5 ramp=true
+invoke OperationalData.SetSpeed speed=20 ramp=false
+invoke OperationalData.Log lines=a,b
+invoke OperationalData.Stop
+invoke OperationalData.SetSpeed speed=30 ramp=true
+
+
+11. The server stops - an invocation fails at once: 502, not reachable
+======================================================================
+502
+"the operation could not be read: connect: Connection refused"
+
+

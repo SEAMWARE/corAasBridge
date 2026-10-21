@@ -1,0 +1,140 @@
+#
+# FILE            aas_https.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# An AAS server on https, behind an Authorization header: the server's certificate verified against
+# server.caFile (or the system's CA certificates) and its host's name; the header's value from the environment
+# variable server.authorizationEnv names - never from the file.
+#
+#   the right header, caFile           available - the entities
+#   a wrong header                     dormant: 401
+#   no caFile - the system's CAs       dormant: the certificate is not trusted
+#   caFile, the host 127.0.0.1         dormant: the certificate is issued to localhost
+#   insecure                           available - not verified
+#   authorizationEnv unset             the plugin is not loaded: the broker does not start
+#
+# REQUIRE_FEATURE: ASSET_CHANNELS
+#
+--NAME--
+aas bridge - https and an Authorization header: caFile, the system's CAs, insecure; the header from the environment
+
+--TAGS--
+bridge aas
+
+--INIT--
+rm -rf "${AAS_TEST_DIR:?}"
+mkdir -p "$AAS_TEST_DIR"
+mockStart --https --authorization "Bearer s3cret"
+
+--RUN--
+SH=https://acme.example/ids/aas/press-17
+config() {  # config <server members> [host] - the bridge configuration
+  cat > $AAS_TEST_DIR/bridges.json <<J
+{ "aas": { "server": { "url": "https://${2:-localhost}:$AAS_MOCK_PORT", "authorizationEnv": "AAS_TEST_AUTHORIZATION" $1 },
+           "ngsild": { "defaultEntity": false, "assetChannels": { "$SH": { "entities": "natural" } } } } }
+J
+}
+
+echo "01. The right header, caFile - available, the shell"
+echo "==================================================="
+config ", \"caFile\": \"$AAS_TEST_DIR/ca.pem\""
+AAS_TEST_AUTHORIZATION="Bearer s3cret" brokerStart
+entityAwait $SH assetKind Instance
+entityGet $SH assetKind keyValues
+echo
+echo
+
+
+echo "02. A wrong header - dormant, 401"
+echo "================================="
+AAS_TEST_AUTHORIZATION="Bearer wrong" brokerStart
+channelAwait $SH dormant
+assetChannels
+echo
+echo
+
+
+echo "03. No caFile - the system's CA certificates do not trust the server: dormant"
+echo "============================================================================="
+config ""
+AAS_TEST_AUTHORIZATION="Bearer s3cret" brokerStart
+channelAwait $SH dormant
+assetChannels
+echo
+echo
+
+
+echo "04. caFile, but the url's host 127.0.0.1 - the certificate is issued to localhost: dormant"
+echo "============================================================================================"
+config ", \"caFile\": \"$AAS_TEST_DIR/ca.pem\"" 127.0.0.1
+AAS_TEST_AUTHORIZATION="Bearer s3cret" brokerStart
+channelAwait $SH dormant
+assetChannels
+echo
+echo
+
+
+echo "05. insecure - the certificate not verified: available"
+echo "======================================================"
+config ", \"insecure\": true"
+AAS_TEST_AUTHORIZATION="Bearer s3cret" brokerStart
+channelAwait $SH available
+assetChannels
+echo
+echo
+
+
+echo "06. authorizationEnv names a variable that is not set - the broker does not start"
+echo "================================================================================="
+brokerStop
+config ", \"insecure\": true"
+unset AAS_TEST_AUTHORIZATION
+brokerStart 2> /dev/null || echo "brokerStart failed"
+grep -o 'aas: server.authorizationEnv names an environment variable that is not set' "$AAS_TEST_DIR/broker.log"
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+mockStop
+rm -f "${AAS_TEST_DIR:?}/bridges.json"
+
+--EXPECT--
+01. The right header, caFile - available, the shell
+===================================================
+{
+  "assetKind": "Instance",
+  "id": "https://acme.example/ids/aas/press-17",
+  "type": "Shell"
+}
+
+
+02. A wrong header - dormant, 401
+=================================
+https://acme.example/ids/aas/press-17 dormant GET /shells/aHR0cHM6Ly9hY21lLmV4YW1wbGUvaWRzL2Fhcy9wcmVzcy0xNw: 401 in valuesIn=0 valuesOut=-
+
+
+03. No caFile - the system's CA certificates do not trust the server: dormant
+=============================================================================
+https://acme.example/ids/aas/press-17 dormant GET /shells/aHR0cHM6Ly9hY21lLmV4YW1wbGUvaWRzL2Fhcy9wcmVzcy0xNw: the server's certificate: unable to get local issuer certificate in valuesIn=0 valuesOut=-
+
+
+04. caFile, but the url's host 127.0.0.1 - the certificate is issued to localhost: dormant
+============================================================================================
+https://acme.example/ids/aas/press-17 dormant GET /shells/aHR0cHM6Ly9hY21lLmV4YW1wbGUvaWRzL2Fhcy9wcmVzcy0xNw: the server's certificate: IP address mismatch in valuesIn=0 valuesOut=-
+
+
+05. insecure - the certificate not verified: available
+======================================================
+https://acme.example/ids/aas/press-17 available - in valuesIn=0 valuesOut=-
+
+
+06. authorizationEnv names a variable that is not set - the broker does not start
+=================================================================================
+brokerStart failed
+aas: server.authorizationEnv names an environment variable that is not set
+
+
